@@ -155,47 +155,21 @@ The leaf cluster never needs to know where the value originated — it just sees
 
 ## 4. Practical Chaining Patterns
 
-### Pattern 1 — Secret fan-out from Global Hub to leaves
+Four techniques are available. **Pattern 3 is the recommended approach** for any Global Hub topology — it is the only one that scales dynamically with your fleet. Patterns 1, 2, and 4 are building blocks that you compose *inside* Pattern 3 rather than use standalone.
 
-A pull secret or TLS certificate lives **once** on the Global Hub. A `{{hub fromSecret … hub}}` propagates it to Managed Hubs; a second policy on each Managed Hub fans it further to leaf clusters using `{{ fromSecret }}`. The secret is never stored in Git.
+---
 
-```yaml
-# On Global Hub: push TLS secret to each Managed Hub
-data:
-  tls.crt: '{{hub fromSecret "global-policies" "thanos-tls" "tls.crt" hub}}'
-  tls.key: '{{hub fromSecret "global-policies" "thanos-tls" "tls.key" hub}}'
-```
+### ⭐ Pattern 3 — Iterate over all managed clusters (recommended)
 
-Use `copySecretData` to copy all keys at once, instead of templating each key individually:
+The `lookup` function combined with `range` generates a complete configuration block per cluster from a single policy. When a new Managed Hub is onboarded it automatically gets its config — no manual policy updates, no static inventory to maintain. This is the outer shell every Global Hub policy should be built on.
 
-```yaml
-# Copies every key from the source secret — much cleaner for multi-key secrets
-data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
-```
-
-### Pattern 2 — Dynamic per-cluster config from ManagedCluster labels
-
-`.ManagedClusterLabels` gives access to all labels on the target ManagedCluster object. This means the Global Hub can inject per-hub metadata without maintaining a separate ConfigMap per hub.
-
-```yaml
-data:
-  region:      '{{hub index .ManagedClusterLabels "region" hub}}'
-  environment: '{{hub index .ManagedClusterLabels "environment" hub}}'
-  tier:        '{{hub index .ManagedClusterLabels "tier" hub}}'
-  thanos-url:  >-
-    {{hub fromConfigMap "global-policies" "regional-endpoints"
-       (printf "%s-thanos-url" .ManagedClusterName) hub}}
-```
-
-### Pattern 3 — Iterating over all managed clusters to build federation config
-
-The `lookup` function combined with `range` lets you iterate over every ManagedCluster on the hub and generate a configuration block per cluster in a single policy. This is the key building block for generating Prometheus `scrape_config` or Perses datasource entries dynamically.
+The label filter (fifth argument to `lookup`) is critical for fleet performance — only clusters opted in to observability are iterated:
 
 ```yaml
 object-templates-raw: |
   {{hub range (lookup "cluster.open-cluster-management.io/v1"
-                       "ManagedCluster" "" "").items hub}}
-  {{hub if eq (index .metadata.labels "observability") "enabled" hub}}
+                       "ManagedCluster" "" ""
+                       "observability=enabled").items hub}}
   - complianceType: musthave
     objectDefinition:
       apiVersion: v1
@@ -209,35 +183,133 @@ object-templates-raw: |
         ca-bundle:    >-
           {{hub (index .spec.managedClusterClientConfigs 0).caBundle hub}}
   {{hub end hub}}
-  {{hub end hub}}
 ```
 
-Only clusters labelled `observability=enabled` get a scrape target ConfigMap, and every value is sourced live from the ManagedCluster object — no static inventory to maintain.
+Every value is sourced live from the `ManagedCluster` object on the hub — no static inventory to maintain. When a new Managed Hub is onboarded with the `observability=enabled` label, it automatically gets a scrape target ConfigMap on the next reconciliation.
 
-### Pattern 4 — Conditional config based on cluster tier
+---
+
+### Building block: Pattern 1 — Secret fan-out
+
+Use this technique **inside** a Pattern 3 loop to inject credentials into each per-cluster config block. A pull secret or TLS certificate lives once on the Global Hub and is never stored in Git.
+
+Use `copySecretData` to bulk-copy all keys rather than templating each one individually:
 
 ```yaml
-object-templates-raw: |
-  - complianceType: musthave
-    objectDefinition:
-      apiVersion: v1
-      kind: ConfigMap
-      metadata:
-        name: retention-config
-        namespace: monitoring
-      data:
-        retention: >-
-          {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
-          30d
-          {{hub else hub}}
-          7d
-          {{hub end hub}}
-        scrape-interval: >-
-          {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
-          15s
-          {{hub else hub}}
-          60s
-          {{hub end hub}}
+# Inside a range loop or standalone for a single secret propagation
+data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
+```
+
+If you only need specific keys:
+
+```yaml
+data:
+  tls.crt: '{{hub fromSecret "global-policies" "thanos-tls" "tls.crt" hub}}'
+  tls.key: '{{hub fromSecret "global-policies" "thanos-tls" "tls.key" hub}}'
+```
+
+---
+
+### Building block: Pattern 2 — ManagedCluster label injection
+
+Use this technique **inside** a Pattern 3 loop to stamp per-cluster metadata into the generated config — region, environment, tier — without a separate ConfigMap per hub.
+
+```yaml
+data:
+  region:      '{{hub index .ManagedClusterLabels "region" hub}}'
+  environment: '{{hub index .ManagedClusterLabels "environment" hub}}'
+  tier:        '{{hub index .ManagedClusterLabels "tier" hub}}'
+  thanos-url:  >-
+    {{hub fromConfigMap "global-policies" "regional-endpoints"
+       (printf "%s-thanos-url" .ManagedClusterName) hub}}
+```
+
+---
+
+### Building block: Pattern 4 — Conditional config by tier
+
+Use this technique **inside** a Pattern 3 loop to branch on a label value, so production and non-production clusters get different retention or scrape intervals from the same policy.
+
+```yaml
+data:
+  retention: >-
+    {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
+    30d
+    {{hub else hub}}
+    7d
+    {{hub end hub}}
+  scrape-interval: >-
+    {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
+    15s
+    {{hub else hub}}
+    60s
+    {{hub end hub}}
+```
+
+---
+
+### Composite example — all patterns combined inside Pattern 3
+
+This is how the patterns should be used in practice: Pattern 3 as the outer loop, with Patterns 1, 2, and 4 composed inside it. A single policy on the Global Hub generates a fully populated, per-cluster observability ConfigMap for every opted-in Managed Hub — with TLS credentials, regional metadata, and tier-appropriate retention, all resolved at propagation time:
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: policy-observability-per-hub
+  namespace: global-policies
+spec:
+  remediationAction: enforce
+  disabled: false
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: observability-config-per-hub
+        spec:
+          remediationAction: enforce
+          severity: low
+          object-templates-raw: |
+            {{hub range (lookup "cluster.open-cluster-management.io/v1"
+                                 "ManagedCluster" "" ""
+                                 "observability=enabled").items hub}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: observability-config
+                  namespace: monitoring
+                data:
+                  cluster-name: '{{hub .metadata.name hub}}'
+                  api-server:   '{{hub (index .spec.managedClusterClientConfigs 0).url hub}}'
+                  region:       '{{hub index .metadata.labels "region" hub}}'
+                  environment:  '{{hub index .metadata.labels "environment" hub}}'
+                  thanos-url:   >-
+                    {{hub fromConfigMap "global-policies" "regional-endpoints"
+                       (printf "%s-thanos-url" .metadata.name) hub}}
+                  retention: >-
+                    {{hub if eq (index .metadata.labels "tier") "production" hub}}
+                    30d
+                    {{hub else hub}}
+                    7d
+                    {{hub end hub}}
+                  scrape-interval: >-
+                    {{hub if eq (index .metadata.labels "tier") "production" hub}}
+                    15s
+                    {{hub else hub}}
+                    60s
+                    {{hub end hub}}
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: v1
+                kind: Secret
+                metadata:
+                  name: thanos-tls
+                  namespace: monitoring
+                data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
+            {{hub end hub}}
 ```
 
 ---
