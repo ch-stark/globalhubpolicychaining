@@ -166,7 +166,7 @@ data:
   tls.key: '{{hub fromSecret "global-policies" "thanos-tls" "tls.key" hub}}'
 ```
 
-From RHACM 2.8 onwards you can use `copySecretData` to copy all keys at once, instead of templating each key individually:
+Use `copySecretData` to copy all keys at once, instead of templating each key individually:
 
 ```yaml
 # Copies every key from the source secret — much cleaner for multi-key secrets
@@ -175,7 +175,7 @@ data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
 
 ### Pattern 2 — Dynamic per-cluster config from ManagedCluster labels
 
-From RHACM 2.8, `.ManagedClusterLabels` gives access to all labels on the target ManagedCluster object. This means the Global Hub can inject per-hub metadata without maintaining a separate ConfigMap per hub.
+`.ManagedClusterLabels` gives access to all labels on the target ManagedCluster object. This means the Global Hub can inject per-hub metadata without maintaining a separate ConfigMap per hub.
 
 ```yaml
 data:
@@ -454,20 +454,22 @@ spec:
                                 sum by (cluster) (machine_memory_bytes)
 ```
 
-This single policy, placed on the Global Hub and bound to a PlacementRule targeting all Managed Hubs, ensures every regional Perses instance gets an identical fleet dashboard. The `global-thanos-url` key in the ConfigMap is the one place you update when the Global Hub Thanos endpoint changes.
+This single policy, placed on the Global Hub and bound via a `Placement` targeting all Managed Hubs, ensures every regional Perses instance gets an identical fleet dashboard. The `global-thanos-url` key in the ConfigMap is the one place you update when the Global Hub Thanos endpoint changes.
 
-### PlacementBinding to target all Managed Hubs
+### Placement and PlacementBinding to target all Managed Hubs
 
 ```yaml
-apiVersion: apps.open-cluster-management.io/v1
-kind: PlacementRule
+apiVersion: cluster.open-cluster-management.io/v1beta1
+kind: Placement
 metadata:
   name: all-managed-hubs
   namespace: global-policies
 spec:
-  clusterSelector:
-    matchLabels:
-      role: managed-hub          # label your Managed Hub ManagedCluster objects
+  predicates:
+    - requiredClusterSelector:
+        labelSelector:
+          matchLabels:
+            role: managed-hub
 
 ---
 apiVersion: policy.open-cluster-management.io/v1
@@ -477,8 +479,8 @@ metadata:
   namespace: global-policies
 placementRef:
   name: all-managed-hubs
-  apiGroup: apps.open-cluster-management.io
-  kind: PlacementRule
+  apiGroup: cluster.open-cluster-management.io
+  kind: Placement
 subjects:
   - name: policy-perses-datasource
     apiGroup: policy.open-cluster-management.io
@@ -500,21 +502,21 @@ Hub templates are namespace-scoped. Any object referenced in a `{{hub…hub}}` b
 
 `{{hub…hub}}` is resolved **once at propagation time** and the result is immutable in transit. If the source ConfigMap or Secret on the hub changes, the policy must be re-propagated for managed clusters to see the updated value. ACM does this automatically on the next reconciliation cycle, but there is a short lag.
 
-### `copySecretData` and `copyConfigMapData` (RHACM 2.8+)
+### `copySecretData` and `copyConfigMapData`
 
 Prefer these bulk-copy functions over individual key templates when propagating multi-key objects:
 
 ```yaml
-# Instead of templating each key:
+# Bulk copy — cleaner for multi-key secrets:
 data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
 
-# Instead of:
+# Instead of templating each key individually:
 data:
   tls.crt: '{{hub fromSecret "global-policies" "thanos-tls" "tls.crt" hub}}'
   tls.key: '{{hub fromSecret "global-policies" "thanos-tls" "tls.key" hub}}'
 ```
 
-### `lookup` label filtering (RHACM 2.8+)
+### `lookup` label filtering
 
 The `lookup` function accepts a label selector as a fifth argument, which is critical for performance when iterating over large ManagedCluster fleets:
 
