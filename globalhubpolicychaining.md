@@ -1,16 +1,20 @@
 # ACM Policy Template Chaining with Global Hub and PromQL Federation
 
-This is an experimental writeup based on new ACM Observability features and discussion.
+This is an experimental writeup based on ACM Observability (MCOA / Prometheus Agent), Global Hub policy templating, and Perses. It is **not** a supported product architecture for ACM-9685; treat it as a field design note.
+
+Companion reading: [Mastering the Prometheus Agent in RHACM](https://github.com/ch-stark/mcoablog/blob/main/prometheusagent.md) — enforced vs open MCOA fields, `writeRelabelConfigs`, and `ScrapeConfig` for user-workload metrics.
 
 ## Table of Contents
 
 1. [The Two Template Scopes](#1-the-two-template-scopes)
 2. [Global Hub → Managed Hub → Leaf Cluster Topology](#2-global-hub--managed-hub--leaf-cluster-topology)
-3. [Chaining Phases Explained](#3-chaining-phases-explained)
-4. [Practical Chaining Patterns](#4-practical-chaining-patterns)
-5. [PromQL Federation with Perses](#5-promql-federation-with-perses)
-6. [Pushing Perses Config via Policy Chaining](#6-pushing-perses-config-via-policy-chaining)
-7. [Key Constraints](#7-key-constraints)
+3. [Choose One Metrics Architecture](#3-choose-one-metrics-architecture)
+4. [Chaining Phases Explained](#4-chaining-phases-explained)
+5. [Practical Chaining Patterns](#5-practical-chaining-patterns)
+6. [MCOA + Policy Chaining](#6-mcoa--policy-chaining)
+7. [PromQL at the Query Layer](#7-promql-at-the-query-layer)
+8. [Pushing Perses Config via Policy Chaining](#8-pushing-perses-config-via-policy-chaining)
+9. [Key Constraints](#9-key-constraints)
 
 ---
 
@@ -25,6 +29,15 @@ ACM policy templating has two distinct resolution scopes, and understanding the 
 
 `{{hub…hub}}` resolves once on the hub and the result is **baked into** what gets sent to the managed cluster. `{{ }}` resolves later, locally on each managed cluster. You can nest both in a single policy to get a two-phase resolution.
 
+### Hub template variable contexts
+
+There are two different “current object” contexts. Do not mix them.
+
+| Context | Typical variables | When |
+|---|---|---|
+| **Placement-targeted** policy (one managed cluster at a time) | `.ManagedClusterName`, `.ManagedClusterLabels` | Policy is bound via Placement; hub templates resolve per target cluster |
+| **`range` over `lookup` ManagedCluster list** | `.metadata.name`, `.metadata.labels`, `.spec…` | You iterated `ManagedCluster` objects; use the ranged object’s fields |
+
 ---
 
 ## 2. Global Hub → Managed Hub → Leaf Cluster Topology
@@ -32,7 +45,7 @@ ACM policy templating has two distinct resolution scopes, and understanding the 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Global Hub                        │
-│         Multicluster Global Hub · Thanos · Perses    │
+│     Multicluster Global Hub · (optional) Thanos     │
 │              {{hub … hub}} resolution                │
 └──────────┬──────────────────┬──────────────────┬────┘
            │ policy +         │                  │
@@ -41,34 +54,74 @@ ACM policy templating has two distinct resolution scopes, and understanding the 
 ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
 │ Managed Hub A│   │ Managed Hub B│   │ Managed Hub C│
 │ Regional ACM │   │ Regional ACM │   │ Regional ACM │
+│ MCO + MCOA   │   │ MCO + MCOA   │   │ MCO + MCOA   │
 │ {{ }} tmpls  │   │ {{ }} tmpls  │   │ {{ }} tmpls  │
 └──┬──────┬───┘   └──┬──────┬───┘   └──┬──────┬───┘
    │      │          │      │          │      │
    ▼      ▼          ▼      ▼          ▼      ▼
 [C1]    [C2]       [C3]    [C4]      [C5]    [C6]
-Prom    Prom       Prom    Prom      Prom    Prom
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                  PromQL federation layer
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-[C1][C2] ──remote_write──► Hub A Thanos ─┐
-[C3][C4] ──remote_write──► Hub B Thanos ─┼──► Global Hub Thanos Query ──► Perses
-[C5][C6] ──remote_write──► Hub C Thanos ─┘
+MCOA    MCOA       MCOA    MCOA      MCOA    MCOA
+PrometheusAgent    PrometheusAgent   PrometheusAgent
 ```
 
-The Global Hub manages Managed Hubs as its "managed clusters". Each Managed Hub in turn manages its own fleet of leaf clusters. Policy values flow **down** through `{{hub}}` resolution; metrics flow **up** through Thanos remote_write and federation.
+The Global Hub manages Managed Hubs as its "managed clusters". Each Managed Hub manages its own fleet of leaf clusters.
+
+- **Policy values flow down** through `{{hub}}` (then optional `{{ }}` on the Managed Hub for leaves).
+- **Metrics flow up** through MCOA Prometheus Agents (`remoteWrite` to the hub that owns the leaf), then optionally further via **rollup** or **Store API federation** (see §3).
+
+On each leaf, MCOA’s Prometheus Agent scrapes platform (and optional user-workload) targets and remote-writes to that leaf’s **Managed Hub** observatorium. MCOA enforces the base hub remote-write; you may add relabeling, scrape sources, and (carefully) extra remote-write entries. See the [Prometheus Agent writeup](https://github.com/ch-stark/mcoablog/blob/main/prometheusagent.md).
 
 ---
 
-## 3. Chaining Phases Explained
+## 3. Choose One Metrics Architecture
+
+Do not treat these as the same “federation layer.” Pick one primary design and keep Perses / policy examples aligned with it.
+
+### Option A — Federate stores (no merge of TSDB data)
+
+Metrics stay in each Managed Hub’s object store. Global Hub Thanos Query fans out to regional Store APIs.
+
+```
+Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos
+                                              │
+                                              │  Thanos Store API (mTLS / mesh / LB)
+                                              ▼
+                                    Global Hub Thanos Query ──► Perses (on Global Hub)
+```
+
+Closest to ACM-9685 wording (“historical data remains at the original hub… we will not merge of data”). Requires reachable Store endpoints from the Global Hub (not in-cluster DNS to another hub).
+
+### Option B — Remote-write rollup (central copy)
+
+Regional hubs (or leaf agents) also remote-write into a **global** observatorium. Global Perses queries only the global Thanos.
+
+```
+Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos
+                         │
+                         └──(optional second remote_write / hub rollup)──► Global Hub observatorium
+                                                                                    │
+                                                                                    ▼
+                                                                          Perses (on Global Hub)
+```
+
+This is what field Autoshift “global observability” packaging typically implements. It **does** consolidate series at the global tier (extra network + storage cost). Apply `writeRelabelConfigs` before the second hop to control cardinality.
+
+### Option C — Regional Perses UI, central query
+
+Perses runs on each Managed Hub; datasources point at the **Global** Thanos Query URL (injected via `{{hub}}`). Same query backend as A or B; only the UI placement differs.
+
+This doc’s Perses examples in §8 follow **Option C** with a Global Query URL. Collection still follows A or B underneath.
+
+---
+
+## 4. Chaining Phases Explained
 
 ### Phase 1 — Global Hub resolves `{{hub…hub}}`
 
 The Global Hub reads values from its own cluster (Secrets, ConfigMaps, ManagedCluster objects) and bakes them into the policy before forwarding it to each Managed Hub. By the time the policy arrives at a Managed Hub, all `{{hub…hub}}` blocks are already resolved to concrete strings.
 
 ```yaml
-# Policy authored on the Global Hub
+# Policy authored on the Global Hub (placement-targeted → one Managed Hub at a time)
 apiVersion: policy.open-cluster-management.io/v1
 kind: Policy
 metadata:
@@ -91,12 +144,16 @@ spec:
                 kind: ConfigMap
                 metadata:
                   name: observability-config
-                  namespace: monitoring
+                  namespace: open-cluster-management-observability
                 data:
                   thanos-query-url: >-
                     {{hub fromConfigMap "global-policies"
                        "observability-endpoints"
                        (printf "%s-thanos-url" .ManagedClusterName) hub}}
+                  global-thanos-url: >-
+                    {{hub fromConfigMap "global-policies"
+                       "observability-endpoints"
+                       "global-thanos-url" hub}}
                   cluster-region: >-
                     {{hub index .ManagedClusterLabels "region" hub}}
                   cluster-tier: >-
@@ -105,24 +162,29 @@ spec:
 
 When this policy targets Managed Hub A (with label `region=eu-west`), the hub resolves the template and sends down a fully static ConfigMap — no template syntax visible to the Managed Hub.
 
-### Phase 2 — Managed Hub re-templates for its leaf clusters
+### Phase 2 — Managed Hub distributes MCOA-compatible objects to leaves
 
-The Managed Hub can author its own policies that use `{{ }}` (managed-cluster-side) templates referencing the ConfigMap the Global Hub just pushed down. This creates a clean two-stage chain:
+Do **not** push a generic ConfigMap and expect it to change MCOA remote-write. MCOA owns destination; you customize **sources** (`ScrapeConfig`) and **open** PrometheusAgent fields (`writeRelabelConfigs`, additive remote-write, secrets).
+
+Typical chain:
 
 ```
 Global Hub value
     │
     └──{{hub fromConfigMap}}──► ConfigMap on Managed Hub
                                     │
-                                    └──{{ fromConfigMap }}──► Config on Leaf Cluster
+                                    └── Managed Hub policy uses {{ fromConfigMap }}
+                                         to render ScrapeConfig / Agent patches on leaves
 ```
+
+Example: drop noisy series before they leave the leaf (open field; MCOA preserves custom `writeRelabelConfigs` on the enforced `acm-observability` remote-write):
 
 ```yaml
 # Policy authored on the Managed Hub, targeting leaf clusters
 apiVersion: policy.open-cluster-management.io/v1
 kind: Policy
 metadata:
-  name: policy-leaf-scrape-config
+  name: policy-leaf-agent-relabel
   namespace: regional-policies
 spec:
   policy-templates:
@@ -130,42 +192,80 @@ spec:
         apiVersion: policy.open-cluster-management.io/v1
         kind: ConfigurationPolicy
         metadata:
-          name: scrape-config
+          name: mcoa-write-relabel
+        spec:
+          remediationAction: enforce
+          object-templates:
+            - complianceType: musthave
+              objectDefinition:
+                apiVersion: monitoring.rhobs/v1alpha1
+                kind: PrometheusAgent
+                metadata:
+                  name: mcoa-default-platform-metrics-collector-global
+                  namespace: open-cluster-management-observability
+                spec:
+                  remoteWrite:
+                    - name: acm-observability
+                      writeRelabelConfigs:
+                        - action: drop
+                          regex: ^Watchdog$
+                          sourceLabels:
+                            - alertname
+```
+
+Example: point user-workload collection at a COO `MonitoringStack` (custom `ScrapeConfig`; label is required for MCOA discovery):
+
+```yaml
+apiVersion: policy.open-cluster-management.io/v1
+kind: Policy
+metadata:
+  name: policy-leaf-uwl-scrapeconfig
+  namespace: regional-policies
+spec:
+  policy-templates:
+    - objectDefinition:
+        apiVersion: policy.open-cluster-management.io/v1
+        kind: ConfigurationPolicy
+        metadata:
+          name: coo-uwl-scrapeconfig
         spec:
           remediationAction: enforce
           object-templates-raw: |
             - complianceType: musthave
               objectDefinition:
-                apiVersion: v1
-                kind: ConfigMap
+                apiVersion: monitoring.rhobs/v1alpha1
+                kind: ScrapeConfig
                 metadata:
-                  name: prometheus-additional-scrape
-                  namespace: monitoring
-                data:
-                  # Reads the value the Global Hub already pushed to the Managed Hub
-                  remote-write-url: >-
-                    {{ fromConfigMap "monitoring" "observability-config"
-                       "thanos-query-url" }}
-                  region: >-
-                    {{ fromConfigMap "monitoring" "observability-config"
-                       "cluster-region" }}
+                  name: coo-uwl-metrics
+                  namespace: open-cluster-management-observability
+                  labels:
+                    app.kubernetes.io/component: user-workload-metrics-collector
+                spec:
+                  scheme: HTTP
+                  staticConfigs:
+                    - targets:
+                        - >-
+                          {{ fromConfigMap "open-cluster-management-observability"
+                             "observability-config" "coo-monitoring-stack-svc" }}
 ```
 
-The leaf cluster never needs to know where the value originated — it just sees a resolved string.
+The leaf never needs to know whether the service name originated on the Global Hub — it sees a resolved string in the ConfigMap, then a concrete `ScrapeConfig`.
 
 ---
 
-## 4. Practical Chaining Patterns
+## 5. Practical Chaining Patterns
 
 Four techniques are available. **Pattern 3 is the recommended approach** for any Global Hub topology — it is the only one that scales dynamically with your fleet. Patterns 1, 2, and 4 are building blocks that you compose *inside* Pattern 3 rather than use standalone.
+
+> **Note:** Pattern 3 generates objects **on the hub that evaluates the policy** (or on each placement target, depending on how you structure Placement). It is for **config fan-out**, not for teaching MCOA how to scrape. Leaf metric collection still uses PrometheusAgent + ScrapeConfig on the managed cluster.
 
 ---
 
 ### ⭐ Pattern 3 — Iterate over all managed clusters (recommended)
 
-The `lookup` function combined with `range` generates a complete configuration block per cluster from a single policy. When a new Managed Hub is onboarded it automatically gets its config — no manual policy updates, no static inventory to maintain. This is the outer shell every Global Hub policy should be built on.
+The `lookup` function combined with `range` generates a complete configuration block per cluster from a single policy. When a new Managed Hub is onboarded it automatically gets its config — no manual policy updates, no static inventory to maintain.
 
-The label filter (fifth argument to `lookup`) is critical for fleet performance — only clusters opted in to observability are iterated:
+The label filter (fifth argument to `lookup`) is critical for fleet performance — only clusters opted in to observability are iterated. Confirm the `lookup` signature against your ACM Governance docs for your version.
 
 ```yaml
 object-templates-raw: |
@@ -177,25 +277,22 @@ object-templates-raw: |
       apiVersion: v1
       kind: ConfigMap
       metadata:
-        name: scrape-target-{{hub .metadata.name hub}}
-        namespace: monitoring
+        name: hub-meta-{{hub .metadata.name hub}}
+        namespace: open-cluster-management-observability
       data:
         cluster-name: '{{hub .metadata.name hub}}'
-        api-server:   '{{hub (index .spec.managedClusterClientConfigs 0).url hub}}'
-        ca-bundle:    >-
-          {{hub (index .spec.managedClusterClientConfigs 0).caBundle hub}}
+        region: '{{hub index .metadata.labels "region" hub}}'
+        tier: '{{hub index .metadata.labels "tier" hub}}'
   {{hub end hub}}
 ```
 
-Every value is sourced live from the `ManagedCluster` object on the hub — no static inventory to maintain. When a new Managed Hub is onboarded with the `observability=enabled` label, it automatically gets a scrape target ConfigMap on the next reconciliation.
+Every value is sourced live from the `ManagedCluster` object on the hub. Inside this `range`, use **`.metadata.*`**, not `.ManagedClusterName` / `.ManagedClusterLabels`.
 
 ---
 
 ### Building block: Pattern 1 — Secret fan-out
 
-Use this technique **inside** a Pattern 3 loop to inject credentials into each per-cluster config block. A pull secret or TLS certificate lives once on the Global Hub and is never stored in Git.
-
-Use `copySecretData` to bulk-copy all keys rather than templating each one individually:
+Use this technique **inside** a Pattern 3 loop (or in a placement-targeted policy) to inject credentials. Prefer `copySecretData` for multi-key secrets.
 
 ```yaml
 # Inside a range loop or standalone for a single secret propagation
@@ -212,9 +309,9 @@ data:
 
 ---
 
-### Building block: Pattern 2 — ManagedCluster label injection
+### Building block: Pattern 2 — Per-target label injection (placement context)
 
-Use this technique **inside** a Pattern 3 loop to stamp per-cluster metadata into the generated config — region, environment, tier — without a separate ConfigMap per hub.
+Use this in a **placement-targeted** policy (one Managed Hub / cluster at a time). Here the special hub variables apply:
 
 ```yaml
 data:
@@ -226,13 +323,16 @@ data:
        (printf "%s-thanos-url" .ManagedClusterName) hub}}
 ```
 
+Inside a Pattern 3 `range` over `lookup` results, use `.metadata.labels` / `.metadata.name` instead (see composite example below).
+
 ---
 
 ### Building block: Pattern 4 — Conditional config by tier
 
-Use this technique **inside** a Pattern 3 loop to branch on a label value, so production and non-production clusters get different retention or scrape intervals from the same policy.
+Same dual-context rule: `.ManagedClusterLabels` in placement context; `.metadata.labels` inside a `range`.
 
 ```yaml
+# Placement-targeted form
 data:
   retention: >-
     {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
@@ -240,19 +340,13 @@ data:
     {{hub else hub}}
     7d
     {{hub end hub}}
-  scrape-interval: >-
-    {{hub if eq (index .ManagedClusterLabels "tier") "production" hub}}
-    15s
-    {{hub else hub}}
-    60s
-    {{hub end hub}}
 ```
 
 ---
 
-### Composite example — all patterns combined inside Pattern 3
+### Composite example — Pattern 3 + building blocks
 
-This is how the patterns should be used in practice: Pattern 3 as the outer loop, with Patterns 1, 2, and 4 composed inside it. A single policy on the Global Hub generates a fully populated, per-cluster observability ConfigMap for every opted-in Managed Hub — with TLS credentials, regional metadata, and tier-appropriate retention, all resolved at propagation time:
+A single policy on the Global Hub generates a fully populated, per-cluster observability ConfigMap for every opted-in Managed Hub — with TLS credentials, regional metadata, and tier-appropriate retention:
 
 ```yaml
 apiVersion: policy.open-cluster-management.io/v1
@@ -282,10 +376,9 @@ spec:
                 kind: ConfigMap
                 metadata:
                   name: observability-config
-                  namespace: monitoring
+                  namespace: open-cluster-management-observability
                 data:
                   cluster-name: '{{hub .metadata.name hub}}'
-                  api-server:   '{{hub (index .spec.managedClusterClientConfigs 0).url hub}}'
                   region:       '{{hub index .metadata.labels "region" hub}}'
                   environment:  '{{hub index .metadata.labels "environment" hub}}'
                   thanos-url:   >-
@@ -309,34 +402,39 @@ spec:
                 kind: Secret
                 metadata:
                   name: thanos-tls
-                  namespace: monitoring
+                  namespace: open-cluster-management-observability
                 data: '{{hub copySecretData "global-policies" "thanos-tls" hub}}'
             {{hub end hub}}
 ```
 
+> **Placement note:** A `range` that emits many objects in one ConfigurationPolicy is evaluated on the **cluster where the policy runs**. For per–Managed-Hub ConfigMaps that must land *on each* Managed Hub, prefer placement-targeted policies (Pattern 2 variables) or ensure your Placement + object namespace model matches how Governance delivers the rendered list. Validate in a lab before relying on the range-emits-everywhere pattern.
+
 ---
 
-## 5. PromQL Federation with Perses
+## 6. MCOA + Policy Chaining
 
-### The full observability stack
+Bridge between Global Hub policies and what MCOA will actually accept. Details and examples: [prometheusagent.md](https://github.com/ch-stark/mcoablog/blob/main/prometheusagent.md).
 
-```
-Leaf cluster Prometheus
-    │
-    │  remote_write  (ACM metrics collector injects `cluster` label)
-    ▼
-Managed Hub · Thanos Receiver
-    │
-    │  Thanos Store API
-    ▼
-Global Hub · Thanos Query Frontend
-    │
-    │  PromQL
-    ▼
-Perses  (datasource = Global Hub Thanos Query endpoint)
-```
+| Concern | Who owns it | Policy guidance |
+|---|---|---|
+| Hub remote-write destination + base TLS | **MCOA** (enforced) | Do not remove `acm-observability` remote-write; Addon Manager reverts that |
+| Extra remote-write (e.g. global rollup) | Platform / GitOps | Additive `remoteWrite` entries + secrets in `open-cluster-management-observability`; MCOA can replicate listed secrets to leaves |
+| Drop / reshape series | You | `writeRelabelConfigs` on the agent (supported / preserved) |
+| What to scrape (UWL / COO / custom) | You | `ScrapeConfig` with `app.kubernetes.io/component: user-workload-metrics-collector` |
+| Default UWL target | MCOA | No custom ScrapeConfig required for in-cluster UWL Prometheus |
 
-Because the ACM metrics collector on each leaf injects a `cluster` label into every time series, all metrics arriving at the Global Hub Thanos carry that label. A Perses dashboard querying the Global Hub Thanos Query endpoint can do **cross-cluster PromQL natively** — no per-cluster dashboards needed.
+Recommended Global Hub → Managed Hub → leaf sequence:
+
+1. Ensure MCO / MCOA (and COO if needed) on Managed Hubs — Autoshift or equivalent packaging is fine as the installer.
+2. Push shared ConfigMaps / TLS via `{{hub}}` into `open-cluster-management-observability` (or the policy namespace used for hub template sources).
+3. On leaves, enforce only **open** customizations: `ScrapeConfig`, `writeRelabelConfigs`, optional additive remote-write for Option B.
+4. Separately configure query (Option A Store list vs Option B global bucket) and Perses datasources (§7–§8).
+
+---
+
+## 7. PromQL at the Query Layer
+
+MCOA’s Prometheus Agent on each leaf injects a `cluster` label into series remote-written to the hub. Once those series are visible to a single Thanos Query (via Option A federation or Option B rollup), Perses can run cross-cluster PromQL without per-cluster dashboards.
 
 ### Cross-cluster PromQL examples
 
@@ -373,16 +471,6 @@ sum by (cluster, namespace) (
 ) > 5
 ```
 
-**Compare a specific metric between two regions using label filtering:**
-
-```promql
-sum by (cluster) (
-  rate(http_requests_total{status=~"5.."}[5m])
-)
-* on(cluster) group_left(region)
-  kube_node_labels{label_region="eu-west"}
-```
-
 **Top-N clusters by network egress:**
 
 ```promql
@@ -393,30 +481,38 @@ topk(5,
 )
 ```
 
-### Thanos Query federation between hub tiers
+### Option A — Thanos Query Store peers (external endpoints)
 
-If you run a Thanos instance on each Managed Hub (aggregating its leaf clusters), the Global Hub Thanos Query can federate across all of them using the Thanos Store API. Configure this in the Global Hub's Thanos Query deployment:
+Managed Hub Store APIs are **not** reachable via Global Hub in-cluster DNS (`*.svc.cluster.local`) unless you have already meshed those services. Lead with external, authenticated endpoints:
 
 ```yaml
-# Global Hub Thanos Query additional stores
+# Illustrative Global Hub Thanos Query args — use real hostnames you expose
 args:
   - query
-  - --store=thanos-store.hub-a.svc.cluster.local:10901
-  - --store=thanos-store.hub-b.svc.cluster.local:10901
-  - --store=thanos-store.hub-c.svc.cluster.local:10901
+  - --store=thanos-store.hub-a.example.com:10901
+  - --store=thanos-store.hub-b.example.com:10901
+  - --store=thanos-store.hub-c.example.com:10901
   - --query.replica-label=replica
   - --query.replica-label=prometheus_replica
 ```
 
-Or if the Managed Hubs are external, expose their Store APIs via a Service of type `LoadBalancer` or through a Submariner/Skupper service mesh, and reference the external addresses in the Global Hub query config.
+Expose each Managed Hub Store API with mTLS (LoadBalancer, Ingress, Submariner, or Skupper), then point Global Query at those addresses. Keeping Store lists in a ConfigMap and templating Query config via policy is optional follow-on work.
+
+### Option B — Query only the global observatorium
+
+If you roll up into the Global Hub, Perses’s datasource is simply the global Thanos Query / observatorium query frontend URL. No Store fan-out required (at the cost of duplicated storage and merge semantics).
 
 ---
 
-## 6. Pushing Perses Config via Policy Chaining
+## 8. Pushing Perses Config via Policy Chaining
 
-Because Perses stores dashboards and datasources as Kubernetes CRs, they are first-class citizens in the ACM policy framework. You manage them exactly like any other configuration object.
+Because Perses stores dashboards and datasources as Kubernetes CRs, they are first-class citizens in the ACM policy framework.
 
-### Push a Perses Datasource pointing at the regional Thanos Query
+> **Schema check:** Confirm the installed Perses CRD group/version on the target cluster (`perses.dev/v1alpha1` vs `v1alpha2`) and the exact `PersesDashboard` / `PersesDataSource` shape for your operator build. Examples below are illustrative.
+
+Architecture assumed here: **Option C** — Perses on each Managed Hub, datasource URL = Global Thanos Query (`global-thanos-url`).
+
+### Push a Perses Datasource pointing at Global Thanos Query
 
 ```yaml
 apiVersion: policy.open-cluster-management.io/v1
@@ -442,8 +538,8 @@ spec:
                 apiVersion: perses.dev/v1alpha1
                 kind: PersesDataSource
                 metadata:
-                  name: thanos-regional
-                  namespace: monitoring
+                  name: thanos-global
+                  namespace: open-cluster-management-observability
                 spec:
                   plugin:
                     kind: PrometheusDataSource
@@ -451,10 +547,10 @@ spec:
                       directUrl: >-
                         {{hub fromConfigMap "global-policies"
                            "observability-endpoints"
-                           (printf "%s-thanos-url" .ManagedClusterName) hub}}
+                           "global-thanos-url" hub}}
 ```
 
-Each Managed Hub receives its own resolved Thanos URL — the `printf` builds the ConfigMap key from `.ManagedClusterName`, so a single policy handles the entire Managed Hub fleet without repetition.
+For a **regional-only** datasource (Option A UI on the Managed Hub querying local Thanos), swap the ConfigMap key to a per-hub URL via `(printf "%s-thanos-url" .ManagedClusterName)`.
 
 ### Push a fleet-wide Perses Dashboard from the Global Hub
 
@@ -483,7 +579,7 @@ spec:
                 kind: PersesDashboard
                 metadata:
                   name: fleet-cpu-saturation
-                  namespace: monitoring
+                  namespace: open-cluster-management-observability
                 spec:
                   datasources:
                     thanos:
@@ -528,7 +624,7 @@ spec:
                                 sum by (cluster) (machine_memory_bytes)
 ```
 
-This single policy, placed on the Global Hub and bound via a `Placement` targeting all Managed Hubs, ensures every regional Perses instance gets an identical fleet dashboard. The `global-thanos-url` key in the ConfigMap is the one place you update when the Global Hub Thanos endpoint changes.
+This single policy, placed on the Global Hub and bound via a `Placement` targeting all Managed Hubs, ensures every regional Perses instance gets an identical fleet dashboard pointed at the same global query URL. Update `global-thanos-url` in one ConfigMap when the endpoint changes.
 
 ### Placement and PlacementBinding to target all Managed Hubs
 
@@ -566,11 +662,11 @@ subjects:
 
 ---
 
-## 7. Key Constraints
+## 9. Key Constraints
 
 ### Namespace scope
 
-Hub templates are namespace-scoped. Any object referenced in a `{{hub…hub}}` block — ConfigMap, Secret, or any other resource looked up via `lookup` — must exist in the **same namespace** as the Policy object itself. Structure your Global Hub policy namespaces accordingly (e.g. one namespace per concern: `global-observability`, `global-security`, `global-networking`).
+Hub templates are namespace-scoped. Any object referenced in a `{{hub…hub}}` block — ConfigMap, Secret, or any other resource looked up via `lookup` — must exist in the **same namespace** as the Policy object itself. Structure your Global Hub policy namespaces accordingly (e.g. `global-policies` for template sources; land rendered objects in `open-cluster-management-observability` on targets).
 
 ### Template resolution order
 
@@ -601,6 +697,10 @@ The `lookup` function accepts a label selector as a fifth argument, which is cri
                      "observability=enabled").items hub}}
 ```
 
+### MCOA reconciliation
+
+Customizations that touch **enforced** fields are reverted by the Addon Manager. Stick to documented open surfaces (`writeRelabelConfigs`, labeled `ScrapeConfig`s, additive remote-write). See [prometheusagent.md](https://github.com/ch-stark/mcoablog/blob/main/prometheusagent.md).
+
 ### Perses CR availability
 
 Perses CRDs must be installed on the target cluster before ACM can enforce `PersesDashboard` or `PersesDataSource` objects. Use a prerequisite policy (with `dependencies`) to ensure the Perses operator is present before the dashboard policy is evaluated.
@@ -623,26 +723,17 @@ Global Hub
        │
        └─ {{hub fromConfigMap / fromSecret / lookup hub}}
             │
-            ├─ Resolved policy ──► Managed Hub A
+            ├─ Resolved policy ──► Managed Hub A (MCO + MCOA)
             │                          │
-            │                          └─ {{ fromConfigMap }}
-            │                               └─ Config on Leaf Cluster 1, 2
-            │
+            │                          └─ {{ }} / musthave
+            │                               ├─ ScrapeConfig / Agent patches on leaves
+            │                               └─ Perses CR (Option C) → global-thanos-url
             ├─ Resolved policy ──► Managed Hub B
-            │                          └─ ...
-            │
             └─ Resolved policy ──► Managed Hub C
-                                       └─ ...
 
-Perses (on each Managed Hub)
-  └─ PersesDataSource  ◄── policy from Global Hub (Thanos URL injected via {{hub}})
-  └─ PersesDashboard   ◄── policy from Global Hub (shared fleet dashboards)
-       │
-       └─ PromQL ──► Managed Hub Thanos Query
-                          │
-                          └─ Thanos Store API ──► Global Hub Thanos Query
-                                                       │
-                                                       └─ fan-out across all leaf
-                                                          cluster Prometheus instances
-                                                          (each carrying `cluster` label)
+Metrics (pick one):
+  Option A: Leaf Agent → Managed Hub Thanos ──Store API──► Global Thanos Query → Perses
+  Option B: Leaf Agent → Managed Hub (+ rollup remote_write) → Global observatorium → Perses
+
+Policy down · metrics up · query layer chosen explicitly
 ```
