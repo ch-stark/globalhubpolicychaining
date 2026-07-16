@@ -1,5 +1,7 @@
 # ACM Policy Template Chaining with Global Hub and PromQL Federation
 
+This is an experimental writeup based on new ACM Observability features and discussion.
+
 ## Table of Contents
 
 1. [The Two Template Scopes](#1-the-two-template-scopes)
