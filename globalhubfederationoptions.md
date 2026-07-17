@@ -12,7 +12,7 @@ Related RFE: [ACM-9685](https://redhat.atlassian.net/browse/ACM-9685) — *query
 
 | | **A — Federate stores** | **B — Remote-write rollup** |
 |---|---|---|
-| Where TSDB (Time Series DataBase) lives | Only on each Managed Hub | Managed Hub **and** Global Hub |
+| Where TSDB lives | Only on each Managed Hub | Managed Hub **and** Global Hub |
 | What Global Query talks to | Regional Store APIs | Local global Thanos only |
 | ACM-9685 “no merge” | Yes | No (central copy) |
 
@@ -26,6 +26,49 @@ B: Leaf Agent → Managed Hub Thanos
 ```
 
 Perses UI placement (Global Hub vs regional) is orthogonal — see Option C in the chaining doc. Collection is still A or B underneath.
+
+**TSDB** = Time Series Database — the Prometheus/Thanos object-store blocks that hold metric samples. “No merge of TSDB data” means do not copy those series into a second central store.
+
+---
+
+## Effort: which option costs more?
+
+**Option A is more effort.** Option B reuses MCOA’s write path more; A adds a cross-hub query/networking layer that MCOA does not provide.
+
+| | Effort driver | Why |
+|---|---|---|
+| **A — Federate stores** | Higher | Expose each Managed Hub Store (LB/Ingress/mesh + mTLS), maintain Global Query `--store` list, live with fan-out latency / partial outages. Almost none of that is MCOA. |
+| **B — Rollup** | Lower for global UI | Keep one Global Query + Perses. Extra work is a second `remoteWrite` (and storage), which sits closer to existing MCOA Agent surfaces. |
+
+MCOA already covers **leaf → its Managed Hub**. Crossing Managed Hubs (A or B) is extra architecture on top.
+
+---
+
+## What MCOA already gives you
+
+Companion: [Mastering the Prometheus Agent in RHACM](https://github.com/ch-stark/mcoablog/blob/main/prometheusagent.md).
+
+On each leaf / Managed Hub pair:
+
+| Already (supported surfaces) | Not MCOA |
+|---|---|
+| Enforced `remoteWrite` to **that** hub’s observatorium + TLS | Global Hub querying **other** hubs’ Stores (Option A) |
+| `writeRelabelConfigs` on the hub remote-write | Product “no-merge multi-hub query” (ACM-9685) |
+| Custom `ScrapeConfig` (UWL / COO / extra targets) | Exposing Store APIs across regions |
+| `cluster` label on series | Global Perses pointing at federated Stores |
+| Carefully: **additive** `remoteWrite` (helps Option B) | Automatic rollup into a Global Hub bucket |
+
+Default path today (full regional observability, **not** Global Hub cross-hub dashboards):
+
+```
+Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos → Perses (on that hub)
+```
+
+Practical takeaway:
+
+- Need fleet metrics **per Managed Hub only** → MCOA as-is; no A/B.
+- Need a **global view with least new plumbing** → Option B (additive remote-write / hub rollup + global Thanos). Closest to “extend what MCOA already does.”
+- Need **ACM-9685 no-merge** → Option A; plan for Store exposure and Query fan-out — that effort is networking/Thanos, not MCOA feature flags.
 
 ---
 
