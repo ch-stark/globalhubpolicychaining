@@ -10,21 +10,27 @@ Related RFE: [ACM-9685](https://redhat.atlassian.net/browse/ACM-9685) — *query
 
 ## Verdict
 
-| | **A — Federate stores** | **B — Remote-write rollup** |
+| | **A — Federate query-frontends** | **B — Remote-write rollup** |
 |---|---|---|
 | Where TSDB lives | Only on each Managed Hub | Managed Hub **and** Global Hub |
-| What Global Query talks to | Regional Store APIs | Local global Thanos only |
+| What Global Thanos talks to | Managed Hub query-frontends (reachable from Global Hub) | Local global Thanos only |
+| Who does the hard work | Networking + Global Hub Thanos config (depends who owns that) | Ingest path; Global Hub pays ongoing resources |
 | ACM-9685 “no merge” | Yes | No (central copy) |
 
 Option A matches ACM-9685 wording (“historical data remains at the original hub… we will not merge of data”).
-Option B deliberately consolidates a second copy — but for Global Hub query load it is usually the better engineering trade.
+Option B consolidates a second copy on the Global Hub.
 
-**Expert lean (field / platform review):** Prefer **Option B** for resource efficiency. Global Query that fans out to every Managed Hub Store (A) burns CPU, memory, and cross-region bandwidth on every dashboard refresh. A curated rollup (B) pays write + storage once for a subset, then queries stay local and cheap. If the goal is only a **subset** of Managed Hub metrics at Global Hub, Option B still fits — filter with `writeRelabelConfigs` on the second hop; you do not need Store federation for that.
+**Expert lean (field / platform review):** Prefer **Option B** when you want **less to do**. For Option A you must (1) give the Global Hub access to each Managed Hub’s **query-frontend**, and (2) specially configure Global Hub Thanos to target those endpoints — effort depends on who owns that networking/config. If instead the Global Hub **ingests** the metrics (Option B), there is less cross-hub plumbing; the tradeoff is **Global Hub resource usage** (ingest, storage, query CPU/memory). A curated subset still fits B via `writeRelabelConfigs` on the second hop.
 
 ```
-A: Leaf Agent → Managed Hub Thanos ──Store API──► Global Query → Perses
+A: Leaf Agent → Managed Hub Thanos
+                      │
+                      │  query-frontend (access from Global Hub + Thanos config)
+                      ▼
+            Global Hub Thanos Query ──► Perses
+
 B: Leaf Agent → Managed Hub Thanos
-                    └── remote_write (subset) ──► Global observatorium → Perses
+                    └── remote_write (subset or full) ──► Global observatorium → Perses
 ```
 
 Perses UI placement (Global Hub vs regional) is orthogonal — see Option C in the chaining doc. Collection is still A or B underneath.
@@ -33,14 +39,14 @@ Perses UI placement (Global Hub vs regional) is orthogonal — see Option C in t
 
 ---
 
-## Effort: which option costs more?
+## Effort: who does what?
 
-**Option A is more effort.** Option B reuses MCOA’s write path more; A adds a cross-hub query/networking layer that MCOA does not provide.
+**Option A is more operational work** (access + Thanos targeting). **Option B is less work**, at the expense of Global Hub resources.
 
-| | Effort / runtime cost | Why |
+| | Setup / ownership | Ongoing cost |
 |---|---|---|
-| **A — Federate stores** | Higher to build **and** to run | Expose each Managed Hub Store (LB/Ingress/mesh + mTLS), maintain Global Query `--store` list, live with fan-out latency / partial outages. Query-time fan-out is the ongoing resource tax. Almost none of that is MCOA. |
-| **B — Rollup** | Lower for global UI; cheaper at query time | Keep one Global Query + Perses. Extra work is a second `remoteWrite` (and storage for a **subset**), which sits closer to existing MCOA Agent surfaces. Pay once on write; Global Query stays local. |
+| **A — Federate query-frontends** | Must provide Global Hub **access** to each Managed Hub query-frontend, then specially configure Global Hub Thanos to target them. Effort depends on who owns networking vs Thanos config. | Query fan-out across hubs (latency, partial failure). No second copy of TSDB. |
+| **B — Rollup / ingest** | Point a second remote-write (or hub rollup) at Global Hub. Less cross-hub query plumbing. | **Global Hub resources**: ingest bandwidth, object store, Query CPU/memory — higher if you ingest “everything,” lower if you roll up a curated subset. |
 
 MCOA already covers **leaf → its Managed Hub**. Crossing Managed Hubs (A or B) is extra architecture on top.
 
@@ -54,10 +60,10 @@ On each leaf / Managed Hub pair:
 
 | Already (supported surfaces) | Not MCOA |
 |---|---|
-| Enforced `remoteWrite` to **that** hub’s observatorium + TLS | Global Hub querying **other** hubs’ Stores (Option A) |
+| Enforced `remoteWrite` to **that** hub’s observatorium + TLS | Global Hub access to Managed Hub query-frontends (Option A) |
 | `writeRelabelConfigs` on the hub remote-write | Product “no-merge multi-hub query” (ACM-9685) |
-| Custom `ScrapeConfig` (UWL / COO / extra targets) | Exposing Store APIs across regions |
-| `cluster` label on series | Global Perses pointing at federated Stores |
+| Custom `ScrapeConfig` (UWL / COO / extra targets) | Configuring Global Hub Thanos to target those frontends |
+| `cluster` label on series | Exposing query-frontends across regions (LB / mesh / mTLS) |
 | Carefully: **additive** `remoteWrite` (helps Option B) | Automatic rollup into a Global Hub bucket |
 
 Default path today (full regional observability, **not** Global Hub cross-hub dashboards):
@@ -69,48 +75,55 @@ Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos → Pe
 Practical takeaway:
 
 - Need fleet metrics **per Managed Hub only** → MCOA as-is; no A/B.
-- Need a **global view** (full fleet or a curated subset) with efficient resource use → **Option B** (additive remote-write / hub rollup + `writeRelabelConfigs` + global Thanos). Default recommendation from expert review.
-- Need **ACM-9685 no-merge** as a hard product constraint → Option A; plan for Store exposure and Query fan-out — that effort is networking/Thanos, not MCOA feature flags.
+- Want a **global view with less cross-hub plumbing** → **Option B** (Global Hub ingests; you pay Global Hub resources). Prefer a curated subset via `writeRelabelConfigs` to limit that bill. Default recommendation from expert review.
+- Need **ACM-9685 no-merge** as a hard product constraint → Option A; plan who provides Global Hub **access** to Managed Hub query-frontends and who configures Global Hub Thanos to target them.
 
 ---
 
-## Option A — Federate stores (no merge of TSDB data)
+## Option A — Federate Managed Hub query-frontends (no merge of TSDB data)
 
-Metrics stay in each Managed Hub’s object store. Global Hub Thanos Query fans out to regional Store APIs.
+Metrics stay in each Managed Hub’s object store. Global Hub Thanos is configured to target each Managed Hub’s query-frontend (reachable from the Global Hub — not in-cluster DNS to another hub).
 
 ```
 Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos
                                               │
-                                              │  Thanos Store API (mTLS / mesh / LB)
+                                              │  query-frontend (mTLS / mesh / LB)
                                               ▼
                                     Global Hub Thanos Query ──► Perses (on Global Hub)
 ```
 
-Requires reachable Store endpoints from the Global Hub (not in-cluster DNS to another hub).
+Two concrete jobs for Option A:
+
+1. **Access** — Global Hub must reach each Managed Hub query-frontend.
+2. **Thanos config** — Global Hub Thanos must be specially configured to target those endpoints.
+
+Who owns (1) vs (2) drives the real effort.
 
 ### Pros
 
 - Aligns with ACM-9685: no second copy of series.
 - Regional retention / sovereignty stay where data was written.
-- Hub migration stays natural: old hub keeps history; new hub gets new writes; Query just adds another `--store`.
+- Hub migration stays natural: old hub keeps history; new hub gets new writes; Global Thanos just gains another target.
+- Global Hub does **not** pay full ingest/storage for every regional series.
 
 ### Cons
 
-- Hardest networking: Global Hub must reach each regional Store (LB / Ingress / mesh + mTLS).
-- Query path is chatty: every dashboard fans out to N stores; latency and partial failure (one hub down → gaps) show up in the UI.
-- Ops surface: Store list, certs, firewalls, and Store discovery all live at Global Hub.
+- More to do: access + Global Hub Thanos targeting (depends who owns each part).
+- Query path fans out: latency and partial failure (one hub down → gaps) show up in the UI.
+- Ops surface: endpoint list, certs, firewalls live at Global Hub.
 
-### Snippet — Global Query store list
+### Snippet — Global Hub Thanos targets Managed Hub query-frontends
 
 ```yaml
-# thanos-query args (illustrative)
+# Global Hub Thanos Query / store targets (illustrative)
 args:
   - query
-  - --store=thanos-store.hub-a.example.com:10901
-  - --store=thanos-store.hub-b.example.com:10901
+  - --endpoint=thanos-query-frontend.hub-a.example.com:9090
+  - --endpoint=thanos-query-frontend.hub-b.example.com:9090
   - --query.replica-label=replica
 ```
 
+(Exact flag names — `--store`, `--endpoint`, query-frontend URL — depend on your Thanos / observatorium build; the requirement is the same: Global Hub Thanos must be pointed at reachable Managed Hub query-frontends.)
 ---
 
 ## Option B — Remote-write rollup (central copy)
@@ -130,16 +143,16 @@ What field Autoshift “global observability” packaging typically implements. 
 
 ### Pros
 
-- Simplest Global Perses setup: one datasource URL, no Store fan-out.
-- More efficient resource use at query time: Global Query does not fan out to N regional Stores on every refresh.
-- Query performance and availability depend only on Global Hub (regional hub outage does not break global dashboards for already-ingested data).
+- Simplest Global Perses setup: one local datasource; no Managed Hub query-frontend access list.
+- **Less to do** than Option A: no cross-hub access + Thanos targeting project.
+- Query availability for already-ingested data depends only on Global Hub.
 - Matches common Autoshift / field packaging.
-- Cardinality can be cut on the second hop with `writeRelabelConfigs` — right tool when Global Hub only needs a **subset** of Managed Hub metrics.
+- Cardinality can be cut on the second hop with `writeRelabelConfigs` — right tool when Global Hub only needs a **subset** (limits Global Hub resource bill).
 
 ### Cons
 
 - Explicitly merges / duplicates data — conflicts with ACM-9685 wording.
-- Extra network + object-store cost at Global Hub.
+- **Global Hub resource usage** rises with how much you ingest (network, object store, Query).
 - Two write paths to keep healthy (regional + global); drop/duplicate series if labels or relabeling diverge.
 - Hub migration is messier: “history stays on old hub” is no longer true for anything already rolled up.
 
@@ -161,13 +174,13 @@ Prefer hub-side rollup over a second leaf `remote_write` unless you must bypass 
 
 ## Decision guide
 
-Default engineering recommendation: **Option B**, especially for a curated subset at Global Hub.
+Default when you want **less operational work**: **Option B** (Global Hub ingests; pay with Global Hub resources — prefer a curated subset).
 
 | Prefer **A** when… | Prefer **B** when… |
 |---|---|
-| Product / RFE language is “no merge” (hard constraint) | You want efficient Global Hub query / resource use |
-| Data residency / no central copy is a hard requirement | You need a reliable global UI first |
-| Hub move / split retention matters and no central copy is allowed | Cross-region Store reachability is painful |
-| | Global Hub only needs a **subset** of Managed Hub metrics (`writeRelabelConfigs`) |
+| Product / RFE language is “no merge” (hard constraint) | You want less to do than access + Thanos targeting |
+| Data residency / no central copy is a hard requirement | You accept Global Hub resource cost for ingest |
+| Someone will own Global Hub → Managed Hub query-frontend access **and** Thanos config | Cross-region query-frontend reachability is painful |
+| You must avoid centralizing series | Global Hub only needs a **subset** (`writeRelabelConfigs`) |
 
-Keep architecture docs to these snippets (Query `--store` list or second `remoteWrite` + relabel). Distribute them later via policy chaining if needed; do not explain the metrics design through full ACM Policy wrappers.
+Keep architecture docs to these snippets (Global Thanos → Managed Hub query-frontends, or second `remoteWrite` + relabel). Distribute them later via policy chaining if needed; do not explain the metrics design through full ACM Policy wrappers.
