@@ -17,12 +17,14 @@ Related RFE: [ACM-9685](https://redhat.atlassian.net/browse/ACM-9685) — *query
 | ACM-9685 “no merge” | Yes | No (central copy) |
 
 Option A matches ACM-9685 wording (“historical data remains at the original hub… we will not merge of data”).
-Option B is simpler to operate day-to-day but deliberately consolidates a second copy.
+Option B deliberately consolidates a second copy — but for Global Hub query load it is usually the better engineering trade.
+
+**Expert lean (field / platform review):** Prefer **Option B** for resource efficiency. Global Query that fans out to every Managed Hub Store (A) burns CPU, memory, and cross-region bandwidth on every dashboard refresh. A curated rollup (B) pays write + storage once for a subset, then queries stay local and cheap. If the goal is only a **subset** of Managed Hub metrics at Global Hub, Option B still fits — filter with `writeRelabelConfigs` on the second hop; you do not need Store federation for that.
 
 ```
 A: Leaf Agent → Managed Hub Thanos ──Store API──► Global Query → Perses
 B: Leaf Agent → Managed Hub Thanos
-                    └── remote_write ──► Global observatorium → Perses
+                    └── remote_write (subset) ──► Global observatorium → Perses
 ```
 
 Perses UI placement (Global Hub vs regional) is orthogonal — see Option C in the chaining doc. Collection is still A or B underneath.
@@ -35,10 +37,10 @@ Perses UI placement (Global Hub vs regional) is orthogonal — see Option C in t
 
 **Option A is more effort.** Option B reuses MCOA’s write path more; A adds a cross-hub query/networking layer that MCOA does not provide.
 
-| | Effort driver | Why |
+| | Effort / runtime cost | Why |
 |---|---|---|
-| **A — Federate stores** | Higher | Expose each Managed Hub Store (LB/Ingress/mesh + mTLS), maintain Global Query `--store` list, live with fan-out latency / partial outages. Almost none of that is MCOA. |
-| **B — Rollup** | Lower for global UI | Keep one Global Query + Perses. Extra work is a second `remoteWrite` (and storage), which sits closer to existing MCOA Agent surfaces. |
+| **A — Federate stores** | Higher to build **and** to run | Expose each Managed Hub Store (LB/Ingress/mesh + mTLS), maintain Global Query `--store` list, live with fan-out latency / partial outages. Query-time fan-out is the ongoing resource tax. Almost none of that is MCOA. |
+| **B — Rollup** | Lower for global UI; cheaper at query time | Keep one Global Query + Perses. Extra work is a second `remoteWrite` (and storage for a **subset**), which sits closer to existing MCOA Agent surfaces. Pay once on write; Global Query stays local. |
 
 MCOA already covers **leaf → its Managed Hub**. Crossing Managed Hubs (A or B) is extra architecture on top.
 
@@ -67,8 +69,8 @@ Leaf PrometheusAgent ──remote_write──► Managed Hub MCO / Thanos → Pe
 Practical takeaway:
 
 - Need fleet metrics **per Managed Hub only** → MCOA as-is; no A/B.
-- Need a **global view with least new plumbing** → Option B (additive remote-write / hub rollup + global Thanos). Closest to “extend what MCOA already does.”
-- Need **ACM-9685 no-merge** → Option A; plan for Store exposure and Query fan-out — that effort is networking/Thanos, not MCOA feature flags.
+- Need a **global view** (full fleet or a curated subset) with efficient resource use → **Option B** (additive remote-write / hub rollup + `writeRelabelConfigs` + global Thanos). Default recommendation from expert review.
+- Need **ACM-9685 no-merge** as a hard product constraint → Option A; plan for Store exposure and Query fan-out — that effort is networking/Thanos, not MCOA feature flags.
 
 ---
 
@@ -129,9 +131,10 @@ What field Autoshift “global observability” packaging typically implements. 
 ### Pros
 
 - Simplest Global Perses setup: one datasource URL, no Store fan-out.
+- More efficient resource use at query time: Global Query does not fan out to N regional Stores on every refresh.
 - Query performance and availability depend only on Global Hub (regional hub outage does not break global dashboards for already-ingested data).
 - Matches common Autoshift / field packaging.
-- Cardinality can be cut on the second hop with `writeRelabelConfigs`.
+- Cardinality can be cut on the second hop with `writeRelabelConfigs` — right tool when Global Hub only needs a **subset** of Managed Hub metrics.
 
 ### Cons
 
@@ -158,10 +161,13 @@ Prefer hub-side rollup over a second leaf `remote_write` unless you must bypass 
 
 ## Decision guide
 
+Default engineering recommendation: **Option B**, especially for a curated subset at Global Hub.
+
 | Prefer **A** when… | Prefer **B** when… |
 |---|---|
-| Product / RFE language is “no merge” | You need a reliable global UI first |
-| Data residency / no central copy is a hard requirement | Cross-region Store reachability is painful |
-| Hub move / split retention matters | Cardinality at global is a curated subset |
+| Product / RFE language is “no merge” (hard constraint) | You want efficient Global Hub query / resource use |
+| Data residency / no central copy is a hard requirement | You need a reliable global UI first |
+| Hub move / split retention matters and no central copy is allowed | Cross-region Store reachability is painful |
+| | Global Hub only needs a **subset** of Managed Hub metrics (`writeRelabelConfigs`) |
 
 Keep architecture docs to these snippets (Query `--store` list or second `remoteWrite` + relabel). Distribute them later via policy chaining if needed; do not explain the metrics design through full ACM Policy wrappers.
