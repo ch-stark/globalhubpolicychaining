@@ -12,7 +12,7 @@ Related RFE: [ACM-9685](https://redhat.atlassian.net/browse/ACM-9685) — *query
 
 | | **A — Federate stores** | **B — Remote-write rollup** |
 |---|---|---|
-| Where TSDB lives | Only on each Managed Hub | Managed Hub **and** Global Hub |
+| Where TSDB (Time Series DataBase) lives | Only on each Managed Hub | Managed Hub **and** Global Hub |
 | What Global Query talks to | Regional Store APIs | Local global Thanos only |
 | ACM-9685 “no merge” | Yes | No (central copy) |
 
